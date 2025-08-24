@@ -2,6 +2,8 @@
 import os, time, io, aiohttp
 from typing import Optional, Tuple, List, Dict
 from openai import OpenAI
+# add near the top
+import re
 
 _client = None
 _assistant_id = os.getenv("NPF_ASSISTANT_ID")  # asst_...
@@ -124,21 +126,43 @@ def run_and_wait(thread_id: str, assistant_id: str, timeout_s: int = 90) -> Tupl
 
 
 def format_with_citations(answer: str, citations: List[dict]) -> str:
+    """
+    Formats citations as:
+      [1] "quoted text..." (Filename.pdf, page X)
+    Falls back to (page n/a) if no page number is present in the quote.
+    """
     if not citations:
         return answer
+
     seen = set()
     lines = []
     idx = 1
+    page_rx = re.compile(r"(?:page|p\.)\s*(\d+)", re.IGNORECASE)
+
     for c in citations:
         fid = c.get("file_id")
         filename = _FILE_MAP.get(fid, fid)  # fallback to fid if name not found
         snippet = (c.get("quote", "") or "").strip()
+
+        # Extract page number from the snippet if the model included it, e.g. "(page 3)" or "p. 3"
+        page = None
+        if snippet:
+            m = page_rx.search(snippet)
+            if m:
+                page = m.group(1)
+
+        # If no quote, show a minimal reference
         if not snippet:
             snippet = f"See source {filename}"
+
+        # Trim overly long quotes for Discord neatness
         if len(snippet) > 140:
             snippet = snippet[:137] + "..."
-        lines.append(f"[{idx}] {snippet} ({filename})")
+
+        page_part = f", page {page}" if page else ", page n/a"
+        lines.append(f"[{idx}] {snippet} ({filename}{page_part})")
         idx += 1
+
     return f"{answer}\n\n**Citations:**\n" + "\n".join(lines)
 
 
