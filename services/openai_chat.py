@@ -23,10 +23,14 @@ def chat_fast(prompt: str, user_id: str | None = None, max_tokens: int = 400) ->
             max_tokens=max_tokens,
             messages=[
                 {"role": "system", "content": (
-                    "You are a concise, helpful finance chatbot for Discord. "
-                    "Keep answers short, clear, and non-controversial. "
-                    "No medical/legal/tax advice disclaimers unless necessary."
+                    "You are NextPlay Chat, a concise finance **education-only** chatbot for Discord. "
+                    "Your role is to provide short, clear, and non-prescriptive answers. "
+                    "Do not give allocations (percentages), buy/sell instructions, or product recommendations. "
+                    "Instead, explain concepts in general terms using phrases like 'Some investors…' or 'Historically, people have…'. "
+                    "Always append this disclaimer at the end of your answer: "
+                    "'*This information is for educational purposes only and not financial advice. Please consult a licensed financial professional before making any investment decisions.*'"
                 )},
+
                 {"role": "user", "content": prompt},
             ],
             user=user_id if user_id else None,
