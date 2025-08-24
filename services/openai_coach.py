@@ -40,13 +40,17 @@ async def fetch_attachment_bytes(url: str, content_type: str) -> bytes:
             return await r.read()
 
 
+_FILE_MAP: Dict[str, str] = {}  # global
+
 def upload_file_to_openai(file_bytes: bytes, filename: str, mime: str) -> str:
     client = _client_once()
     f = client.files.create(
         file=(filename, io.BytesIO(file_bytes), mime),
         purpose="assistants",
     )
+    _FILE_MAP[f.id] = filename  # store mapping
     return f.id
+
 
 
 def post_user_message(thread_id: str, content: str, file_ids: Optional[List[str]] = None):
@@ -126,16 +130,14 @@ def format_with_citations(answer: str, citations: List[dict]) -> str:
     lines = []
     idx = 1
     for c in citations:
-        key = (c.get("file_id"), c.get("quote", ""))
-        if key in seen:
-            continue
-        seen.add(key)
+        fid = c.get("file_id")
+        filename = _FILE_MAP.get(fid, fid)  # fallback to fid if name not found
         snippet = (c.get("quote", "") or "").strip()
         if not snippet:
-            snippet = f"See source {c.get('file_id', 'unknown')}"
+            snippet = f"See source {filename}"
         if len(snippet) > 140:
             snippet = snippet[:137] + "..."
-        lines.append(f"[{idx}] {snippet}")
+        lines.append(f"[{idx}] {snippet} ({filename})")
         idx += 1
     return f"{answer}\n\n**Citations:**\n" + "\n".join(lines)
 
