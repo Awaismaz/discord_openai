@@ -11,7 +11,7 @@ MAX_FILE_MB = 15
 
 # In-memory stores (Phase 1)
 _THREAD_BY_USER: Dict[str, str] = {}
-_VECTOR_BY_USER: Dict[str, str] = {}
+_HAS_FILE_IN_SESSION: Dict[str, bool] = {}  # tracks if user uploaded at least one file this session
 
 
 def _client_once():
@@ -28,27 +28,9 @@ def get_or_create_thread(user_id: str) -> str:
     client = _client_once()
     thread = client.beta.threads.create()
     _THREAD_BY_USER[user_id] = thread.id
+    # A brand-new thread has no files yet
+    _HAS_FILE_IN_SESSION[user_id] = False
     return thread.id
-
-
-def has_vstore(user_id: str) -> bool:
-    return user_id in _VECTOR_BY_USER
-
-
-def get_or_create_vstore(user_id: str) -> str:
-    """Per-user vector store used by file_search for retrieval/quotes."""
-    if user_id in _VECTOR_BY_USER:
-        return _VECTOR_BY_USER[user_id]
-    vs = _client_once().beta.vector_stores.create(name=f"npf-vs-{user_id}")
-    _VECTOR_BY_USER[user_id] = vs.id
-    return vs.id
-
-
-def add_file_to_vstore(vector_store_id: str, file_id: str):
-    _client_once().beta.vector_stores.files.create(
-        vector_store_id=vector_store_id,
-        file_id=file_id
-    )
 
 
 async def fetch_attachment_bytes(url: str, content_type: str) -> bytes:
@@ -68,7 +50,10 @@ def upload_file_to_openai(file_bytes: bytes, filename: str, mime: str) -> str:
 
 
 def post_user_message(thread_id: str, content: str, file_ids: Optional[List[str]] = None):
-    """Post the user's question and (optionally) attach files (with file_search tool)."""
+    """
+    Post user's question and (optionally) attach files with file_search tool.
+    This attachment path enables retrieval without needing vector stores.
+    """
     client = _client_once()
     attachments = []
     if file_ids:
@@ -82,17 +67,15 @@ def post_user_message(thread_id: str, content: str, file_ids: Optional[List[str]
     )
 
 
-def run_and_wait(thread_id: str, assistant_id: str, vstore_id: Optional[str], timeout_s: int = 90) -> Tuple[str, List[dict]]:
-    """Kick off a run (bound to vector store) and wait for completion."""
+def run_and_wait(thread_id: str, assistant_id: str, timeout_s: int = 90) -> Tuple[str, List[dict]]:
+    """
+    Start a run (Assistant must have file_search tool enabled) and wait for completion.
+    """
     client = _client_once()
-
-    # Require a vector store for retrieval answers (enforces quote-first behavior via Assistant prompt)
-    tool_resources = {"file_search": {"vector_stores": [vstore_id]}} if vstore_id else None
-
     run = client.beta.threads.runs.create(
         thread_id=thread_id,
         assistant_id=assistant_id,
-        tool_resources=tool_resources
+        # No tool_resources passed: retrieval will operate over files attached to the thread/messages
     )
 
     t0 = time.time()
@@ -161,14 +144,14 @@ async def coach_answer(user_id: str, question: Optional[str], attachment: Option
     """
     attachment: dict with keys {url, filename, content_type, size}
     Behavior (Phase 1):
-      - Requires at least one PDF/TXT uploaded per session (per-user vector store).
+      - Requires at least one PDF/TXT uploaded per session (tracked in-memory).
       - Retrieval-first answers (quote + page number if available) via Assistant prompt.
-      - Summaries only when user explicitly asks to summarize.
+      - Summaries only when user explicitly asks to summarize (enforced in prompt).
     """
     if not _assistant_id:
         return "Assistant is not configured yet. Please set NPF_ASSISTANT_ID."
 
-    vstore_id: Optional[str] = None
+    thread_id = get_or_create_thread(user_id)
     file_ids: List[str] = []
 
     # Handle upload (optional per call; required at least once per session)
@@ -183,26 +166,19 @@ async def coach_answer(user_id: str, question: Optional[str], attachment: Option
         data = await fetch_attachment_bytes(attachment["url"], ct)
         fid = upload_file_to_openai(data, attachment["filename"], ct)
         file_ids.append(fid)
+        _HAS_FILE_IN_SESSION[user_id] = True
 
-        # Ensure vector store exists and attach the file(s)
-        vstore_id = get_or_create_vstore(user_id)
-        for fid in file_ids:
-            add_file_to_vstore(vstore_id, fid)
-
-    # If no upload in this call, require an existing vector store (enforces upload-before-QA)
-    if not file_ids:
-        if not has_vstore(user_id):
-            return "Please upload a PDF or TXT to start a new session."
-        vstore_id = _VECTOR_BY_USER[user_id]
+    # If no upload in this call, require a prior upload in this session
+    if not file_ids and not _HAS_FILE_IN_SESSION.get(user_id, False):
+        return "Please upload a PDF or TXT to start a new session."
 
     # Post the user question and run
-    thread_id = get_or_create_thread(user_id)
     post_user_message(thread_id, question or "", file_ids if file_ids else None)
-    answer, cites = run_and_wait(thread_id, _assistant_id, vstore_id=vstore_id)
+    answer, cites = run_and_wait(thread_id, _assistant_id)
     return format_with_citations(answer, cites)
 
 
 def reset_user_thread(user_id: str):
-    """Clear both thread and vector store so user must upload again (client requirement)."""
+    """Clear thread and session flag so user must upload again (client requirement)."""
     _THREAD_BY_USER.pop(user_id, None)
-    _VECTOR_BY_USER.pop(user_id, None)
+    _HAS_FILE_IN_SESSION.pop(user_id, None)
