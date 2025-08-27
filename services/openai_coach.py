@@ -1,19 +1,24 @@
 # services/openai_coach.py
-import os, time, io, aiohttp, asyncio, re
+import os, time, io, re, difflib
+import aiohttp
 from typing import Optional, Tuple, List, Dict
 from openai import OpenAI
+
+# NEW: PDF page extraction
+import fitz  # PyMuPDF
 
 _client = None
 _assistant_id = os.getenv("NPF_ASSISTANT_ID")  # asst_...
 # Phase-1 scope: PDFs (+ optional TXT), no OCR/images
 ALLOWED_TYPES = {"application/pdf", "text/plain"}
 MAX_FILE_MB = 15
-MIN_FILE_BYTES = 1024  # consider <1KB effectively empty for our purposes
+MIN_FILE_BYTES = 1024  # consider <1KB effectively empty
 
 # In-memory stores (Phase 1)
 _THREAD_BY_USER: Dict[str, str] = {}
-_HAS_FILE_IN_SESSION: Dict[str, bool] = {}  # tracks if user uploaded at least one file this session
-_FILE_MAP: Dict[str, str] = {}  # file_id -> original filename
+_HAS_FILE_IN_SESSION: Dict[str, bool] = {}            # tracks if user uploaded at least one file this session
+_FILE_MAP: Dict[str, str] = {}                        # file_id -> original filename
+_PAGE_INDEX: Dict[str, Dict[str, List[str]]] = {}     # user_id -> file_id -> [normalized page text]
 
 
 def _client_once():
@@ -61,10 +66,67 @@ def upload_file_to_openai(file_bytes: bytes, filename: str, mime: str) -> str:
             purpose="assistants",
         )
     except Exception as e:
-        # Treat any ingestion failure as "corrupted/unreadable" for user clarity
         raise RuntimeError("UPLOAD_ERROR_CORRUPTED") from e
     _FILE_MAP[f.id] = filename
     return f.id
+
+
+# ---------- PDF PAGE INDEXING (Option A) ----------
+
+def _norm(s: str) -> str:
+    # normalize for matching: lowercase, collapse whitespace, strip quotes
+    s = s or ""
+    s = s.replace("\u00a0", " ")  # nbsp
+    s = " ".join(s.split())
+    s = s.strip().lower()
+    return s
+
+def _strip_page_tag(snippet: str) -> str:
+    # remove things like (page 3) or p. 5 from the end
+    return re.sub(r"\(?\b(?:page|p\.)\s*\d+\)?$", "", snippet, flags=re.IGNORECASE).strip()
+
+def extract_pdf_pages(pdf_bytes: bytes) -> List[str]:
+    """Return list of normalized text per page."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    pages_norm: List[str] = []
+    for p in doc:
+        text = p.get_text("text") or ""
+        pages_norm.append(_norm(text))
+    doc.close()
+    return pages_norm
+
+def index_pages(user_id: str, file_id: str, pages_norm: List[str]) -> None:
+    _PAGE_INDEX.setdefault(user_id, {})[file_id] = pages_norm
+
+def locate_page(user_id: str, file_id: str, quoted_snippet: str) -> Optional[int]:
+    """
+    Try to find the page (1-based) where quoted_snippet appears.
+    First exact substring, then fuzzy similarity fallback.
+    """
+    pages = _PAGE_INDEX.get(user_id, {}).get(file_id)
+    if not pages:
+        return None
+    q = _norm(_strip_page_tag(quoted_snippet))
+    if not q or len(q) < 12:  # too short to be reliable
+        return None
+
+    # 1) exact substring
+    for i, page_text in enumerate(pages, start=1):
+        if q in page_text:
+            return i
+
+    # 2) fuzzy: compare against each page; pick best if high enough ratio
+    best_page, best_ratio = None, 0.0
+    for i, page_text in enumerate(pages, start=1):
+        # limit page_text length in comparison by searching around first few occurrences of words
+        ratio = difflib.SequenceMatcher(a=q, b=page_text).quick_ratio()
+        if ratio > best_ratio:
+            best_ratio, best_page = ratio, i
+    if best_ratio >= 0.80:
+        return best_page
+    return None
+
+# --------------------------------------------------
 
 
 def post_user_message(thread_id: str, content: str, file_ids: Optional[List[str]] = None):
@@ -130,11 +192,11 @@ def run_and_wait(thread_id: str, assistant_id: str, timeout_s: int = 90) -> Tupl
     return ("\n".join(text_parts).strip() or "No text response.", citations)
 
 
-def format_with_citations(answer: str, citations: List[dict]) -> str:
+def format_with_citations(answer: str, citations: List[dict], user_id: str) -> str:
     """
     Formats citations as:
       [1] "quoted text..." (Filename.pdf, page X)
-    Falls back to (page n/a) if no page number is present in the quote.
+    Falls back to (page n/a) if we cannot locate the page.
     """
     if not citations:
         return answer
@@ -142,26 +204,26 @@ def format_with_citations(answer: str, citations: List[dict]) -> str:
     seen = set()
     lines = []
     idx = 1
-    page_rx = re.compile(r"(?:page|p\.)\s*(\d+)", re.IGNORECASE)
 
     for c in citations:
         fid = c.get("file_id")
-        filename = _FILE_MAP.get(fid, fid)  # fallback to fid if name not found
+        filename = _FILE_MAP.get(fid, fid)  # fallback to fid if unknown
         snippet = (c.get("quote", "") or "").strip()
 
-        page = None
-        if snippet:
-            m = page_rx.search(snippet)
-            if m:
-                page = m.group(1)
+        # Find page via local index (Option A)
+        page = locate_page(user_id, fid, snippet) if (fid and snippet) else None
 
         if not snippet:
             snippet = f"See source {filename}"
-
         if len(snippet) > 140:
             snippet = snippet[:137] + "..."
 
         page_part = f", page {page}" if page else ", page n/a"
+        key = (fid, snippet, page)
+        if key in seen:
+            continue
+        seen.add(key)
+
         lines.append(f"[{idx}] {snippet} ({filename}{page_part})")
         idx += 1
 
@@ -172,9 +234,10 @@ async def coach_answer(user_id: str, question: Optional[str], attachment: Option
     """
     Behavior (Phase 1):
       - Requires at least one PDF/TXT uploaded per session (tracked in-memory).
-      - Retrieval-first answers (quote + page number if available) via Assistant prompt.
-      - Summaries only when user explicitly asks to summarize (enforced in prompt).
+      - Retrieval-first answers (quote + page if available) via Assistant prompt.
+      - Summaries only when explicitly asked (enforced in prompt).
       - Clear errors for empty/corrupted files.
+      - Page numbers computed locally for PDFs by matching quotes per page.
     """
     if not _assistant_id:
         return "Assistant is not configured yet. Please set NPF_ASSISTANT_ID."
@@ -193,11 +256,10 @@ async def coach_answer(user_id: str, question: Optional[str], attachment: Option
         if size == 0:
             return "This file is empty, no analysis possible."
 
-        # Fetch bytes and validate content
+        # Fetch bytes
         try:
             data = await fetch_attachment_bytes(attachment["url"])
-        except RuntimeError as e:
-            # Network/Discord retrieval failure
+        except RuntimeError:
             return "I couldn’t download the file from Discord. Please re-upload and try again."
         except Exception:
             return "Unexpected error fetching the file. Please try again."
@@ -205,7 +267,22 @@ async def coach_answer(user_id: str, question: Optional[str], attachment: Option
         if not data or len(data) < MIN_FILE_BYTES:
             return "This file is empty, no analysis possible."
 
-        # Upload to OpenAI, catching ingestion errors as 'corrupted'
+        # If PDF, extract & index pages for page-locating later
+        if ct == "application/pdf":
+            try:
+                pages = extract_pdf_pages(data)
+                # If PDF has no selectable text (e.g., image-only), pages may be all empty strings
+                if all(len(p.strip()) == 0 for p in pages):
+                    # We allow upload (so assistant can still see metadata) but warn later if nothing found
+                    index_pages(user_id, "pending", [])  # no-op marker
+                else:
+                    # We don't have file_id yet; index after upload when we get it
+                    pass
+            except Exception:
+                # If PyMuPDF can’t read: treat as corrupted
+                return "This file is corrupted and cannot be read."
+
+        # Upload to OpenAI (may raise corrupted)
         try:
             fid = upload_file_to_openai(data, attachment["filename"], ct)
         except RuntimeError as e:
@@ -214,6 +291,18 @@ async def coach_answer(user_id: str, question: Optional[str], attachment: Option
             return "There was a problem processing this file. Please try another file."
         except Exception:
             return "There was a problem processing this file. Please try another file."
+
+        # Index pages now that we have fid
+        if ct == "application/pdf":
+            try:
+                pages = extract_pdf_pages(data)
+                index_pages(user_id, fid, pages)
+            except Exception:
+                # If extraction fails after upload, still proceed; page will be n/a
+                index_pages(user_id, fid, [])
+        else:
+            # TXT: no pages, store empty to render page n/a
+            index_pages(user_id, fid, [])
 
         file_ids.append(fid)
         _HAS_FILE_IN_SESSION[user_id] = True
@@ -226,20 +315,21 @@ async def coach_answer(user_id: str, question: Optional[str], attachment: Option
     post_user_message(thread_id, question or "", file_ids if file_ids else None)
     answer, cites = run_and_wait(thread_id, _assistant_id)
 
-    # If we get an unhelpful generic response after a valid upload, hint user clearly
+    # Helpful message for image-only PDFs (no selectable text)
     if not answer or "I could not find" in answer:
         # This can happen if the document is scanned image-only; we don’t OCR in Phase 1
         return ("I couldn’t find searchable text in this document. "
                 "If it’s a scanned/image-only PDF, text extraction isn’t enabled in this phase.")
 
-    return format_with_citations(answer, cites)
+    return format_with_citations(answer, cites, user_id=user_id)
 
 
 def reset_user_thread(user_id: str):
-    """Clear thread and session flag so user must upload again (client requirement)."""
+    """Clear thread, session flag, filename map, and page index (client requirement)."""
     _THREAD_BY_USER.pop(user_id, None)
     _HAS_FILE_IN_SESSION.pop(user_id, None)
-    # Also clear filename mappings for a clean slate
-    stale = [fid for fid, name in _FILE_MAP.items() if True]  # remove all for this simple Phase-1 impl
-    for fid in stale:
+    # Clear filename mappings for simplicity in Phase 1
+    for fid in list(_FILE_MAP.keys()):
         _FILE_MAP.pop(fid, None)
+    # Clear page index for this user
+    _PAGE_INDEX.pop(user_id, None)
