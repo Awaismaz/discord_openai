@@ -1,19 +1,19 @@
 # services/openai_coach.py
-import os, time, io, aiohttp
+import os, time, io, aiohttp, asyncio, re
 from typing import Optional, Tuple, List, Dict
 from openai import OpenAI
-# add near the top
-import re
 
 _client = None
 _assistant_id = os.getenv("NPF_ASSISTANT_ID")  # asst_...
 # Phase-1 scope: PDFs (+ optional TXT), no OCR/images
 ALLOWED_TYPES = {"application/pdf", "text/plain"}
 MAX_FILE_MB = 15
+MIN_FILE_BYTES = 1024  # consider <1KB effectively empty for our purposes
 
 # In-memory stores (Phase 1)
 _THREAD_BY_USER: Dict[str, str] = {}
 _HAS_FILE_IN_SESSION: Dict[str, bool] = {}  # tracks if user uploaded at least one file this session
+_FILE_MAP: Dict[str, str] = {}  # file_id -> original filename
 
 
 def _client_once():
@@ -30,36 +30,45 @@ def get_or_create_thread(user_id: str) -> str:
     client = _client_once()
     thread = client.beta.threads.create()
     _THREAD_BY_USER[user_id] = thread.id
-    # A brand-new thread has no files yet
     _HAS_FILE_IN_SESSION[user_id] = False
     return thread.id
 
 
-async def fetch_attachment_bytes(url: str, content_type: str) -> bytes:
-    async with aiohttp.ClientSession() as session:
+def _infer_mime_from_name(filename: str) -> Optional[str]:
+    fn = (filename or "").lower()
+    if fn.endswith(".pdf"):
+        return "application/pdf"
+    if fn.endswith(".txt"):
+        return "text/plain"
+    return None
+
+
+async def fetch_attachment_bytes(url: str) -> bytes:
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.get(url) as r:
-            r.raise_for_status()
+            if r.status >= 400:
+                raise RuntimeError(f"FETCH_ERROR_HTTP_{r.status}")
             return await r.read()
 
 
-_FILE_MAP: Dict[str, str] = {}  # global
-
 def upload_file_to_openai(file_bytes: bytes, filename: str, mime: str) -> str:
+    """Upload to OpenAI; raise a clear error if ingestion fails."""
     client = _client_once()
-    f = client.files.create(
-        file=(filename, io.BytesIO(file_bytes), mime),
-        purpose="assistants",
-    )
-    _FILE_MAP[f.id] = filename  # store mapping
+    try:
+        f = client.files.create(
+            file=(filename, io.BytesIO(file_bytes), mime),
+            purpose="assistants",
+        )
+    except Exception as e:
+        # Treat any ingestion failure as "corrupted/unreadable" for user clarity
+        raise RuntimeError("UPLOAD_ERROR_CORRUPTED") from e
+    _FILE_MAP[f.id] = filename
     return f.id
 
 
-
 def post_user_message(thread_id: str, content: str, file_ids: Optional[List[str]] = None):
-    """
-    Post user's question and (optionally) attach files with file_search tool.
-    This attachment path enables retrieval without needing vector stores.
-    """
+    """Post user's question and (optionally) attach files with file_search tool."""
     client = _client_once()
     attachments = []
     if file_ids:
@@ -74,14 +83,11 @@ def post_user_message(thread_id: str, content: str, file_ids: Optional[List[str]
 
 
 def run_and_wait(thread_id: str, assistant_id: str, timeout_s: int = 90) -> Tuple[str, List[dict]]:
-    """
-    Start a run (Assistant must have file_search tool enabled) and wait for completion.
-    """
+    """Start a run (Assistant must have file_search tool enabled) and wait for completion."""
     client = _client_once()
     run = client.beta.threads.runs.create(
         thread_id=thread_id,
         assistant_id=assistant_id,
-        # No tool_resources passed: retrieval will operate over files attached to the thread/messages
     )
 
     t0 = time.time()
@@ -118,7 +124,6 @@ def run_and_wait(thread_id: str, assistant_id: str, timeout_s: int = 90) -> Tupl
                     fc = ad.get("file_citation") or {}
                     citations.append({
                         "file_id": fc.get("file_id"),
-                        # quote may be missing in some SDK versions
                         "quote": (fc.get("quote") or "").strip()
                     })
 
@@ -144,18 +149,15 @@ def format_with_citations(answer: str, citations: List[dict]) -> str:
         filename = _FILE_MAP.get(fid, fid)  # fallback to fid if name not found
         snippet = (c.get("quote", "") or "").strip()
 
-        # Extract page number from the snippet if the model included it, e.g. "(page 3)" or "p. 3"
         page = None
         if snippet:
             m = page_rx.search(snippet)
             if m:
                 page = m.group(1)
 
-        # If no quote, show a minimal reference
         if not snippet:
             snippet = f"See source {filename}"
 
-        # Trim overly long quotes for Discord neatness
         if len(snippet) > 140:
             snippet = snippet[:137] + "..."
 
@@ -168,11 +170,11 @@ def format_with_citations(answer: str, citations: List[dict]) -> str:
 
 async def coach_answer(user_id: str, question: Optional[str], attachment: Optional[dict]) -> str:
     """
-    attachment: dict with keys {url, filename, content_type, size}
     Behavior (Phase 1):
       - Requires at least one PDF/TXT uploaded per session (tracked in-memory).
       - Retrieval-first answers (quote + page number if available) via Assistant prompt.
       - Summaries only when user explicitly asks to summarize (enforced in prompt).
+      - Clear errors for empty/corrupted files.
     """
     if not _assistant_id:
         return "Assistant is not configured yet. Please set NPF_ASSISTANT_ID."
@@ -182,15 +184,37 @@ async def coach_answer(user_id: str, question: Optional[str], attachment: Option
 
     # Handle upload (optional per call; required at least once per session)
     if attachment:
-        ct = attachment["content_type"]
-        size = attachment["size"]
+        ct = attachment.get("content_type") or _infer_mime_from_name(attachment.get("filename", ""))
+        size = attachment.get("size", 0)
         if ct not in ALLOWED_TYPES:
             return "Unsupported file type. Please upload PDF or TXT."
         if size > MAX_FILE_MB * 1024 * 1024:
             return f"File too large. Please keep under {MAX_FILE_MB} MB."
+        if size == 0:
+            return "This file is empty, no analysis possible."
 
-        data = await fetch_attachment_bytes(attachment["url"], ct)
-        fid = upload_file_to_openai(data, attachment["filename"], ct)
+        # Fetch bytes and validate content
+        try:
+            data = await fetch_attachment_bytes(attachment["url"])
+        except RuntimeError as e:
+            # Network/Discord retrieval failure
+            return "I couldn’t download the file from Discord. Please re-upload and try again."
+        except Exception:
+            return "Unexpected error fetching the file. Please try again."
+
+        if not data or len(data) < MIN_FILE_BYTES:
+            return "This file is empty, no analysis possible."
+
+        # Upload to OpenAI, catching ingestion errors as 'corrupted'
+        try:
+            fid = upload_file_to_openai(data, attachment["filename"], ct)
+        except RuntimeError as e:
+            if str(e) == "UPLOAD_ERROR_CORRUPTED":
+                return "This file is corrupted and cannot be read."
+            return "There was a problem processing this file. Please try another file."
+        except Exception:
+            return "There was a problem processing this file. Please try another file."
+
         file_ids.append(fid)
         _HAS_FILE_IN_SESSION[user_id] = True
 
@@ -201,6 +225,13 @@ async def coach_answer(user_id: str, question: Optional[str], attachment: Option
     # Post the user question and run
     post_user_message(thread_id, question or "", file_ids if file_ids else None)
     answer, cites = run_and_wait(thread_id, _assistant_id)
+
+    # If we get an unhelpful generic response after a valid upload, hint user clearly
+    if not answer or "I could not find" in answer:
+        # This can happen if the document is scanned image-only; we don’t OCR in Phase 1
+        return ("I couldn’t find searchable text in this document. "
+                "If it’s a scanned/image-only PDF, text extraction isn’t enabled in this phase.")
+
     return format_with_citations(answer, cites)
 
 
@@ -208,3 +239,7 @@ def reset_user_thread(user_id: str):
     """Clear thread and session flag so user must upload again (client requirement)."""
     _THREAD_BY_USER.pop(user_id, None)
     _HAS_FILE_IN_SESSION.pop(user_id, None)
+    # Also clear filename mappings for a clean slate
+    stale = [fid for fid, name in _FILE_MAP.items() if True]  # remove all for this simple Phase-1 impl
+    for fid in stale:
+        _FILE_MAP.pop(fid, None)
