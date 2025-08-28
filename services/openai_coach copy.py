@@ -5,25 +5,16 @@ from typing import Optional, Tuple, List, Dict
 import aiohttp
 from openai import OpenAI
 import fitz  # PyMuPDF
-from PIL import Image
-import pytesseract
 
 # ------------------------------------------------------
 # Config / Globals
 # ------------------------------------------------------
 _client = None
 _assistant_id = os.getenv("NPF_ASSISTANT_ID")  # asst_...
-# Allow PDFs, TXT, and images (OCR)
-ALLOWED_TYPES = {"application/pdf", "text/plain", "image/png", "image/jpeg"}
+ALLOWED_TYPES = {"application/pdf", "text/plain"}
 MAX_FILE_MB = 15
 MIN_FILE_BYTES = 1024            # treat <1KB as effectively empty
 MIN_TEXT_CHARS_NORM = 40         # minimum normalized text to consider a PDF "not blank"
-OCR_DPI = 200                    # rasterization dpi for OCR
-OCR_LANG = os.getenv("OCR_LANG", "eng")
-TESSERACT_CMD = os.getenv("TESSERACT_CMD")  # optional explicit path
-
-if TESSERACT_CMD:
-    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
 # In-memory state (Phase 1)
 _THREAD_BY_USER: Dict[str, str] = {}                   # user_id -> thread_id
@@ -56,8 +47,6 @@ def _infer_mime_from_name(filename: str) -> Optional[str]:
     fn = (filename or "").lower()
     if fn.endswith(".pdf"): return "application/pdf"
     if fn.endswith(".txt"): return "text/plain"
-    if fn.endswith(".png"): return "image/png"
-    if fn.endswith(".jpg") or fn.endswith(".jpeg"): return "image/jpeg"
     return None
 
 _ws_rx = re.compile(r"\s+", re.UNICODE)
@@ -98,45 +87,10 @@ def upload_file_to_openai(file_bytes: bytes, filename: str, mime: str) -> str:
     return f.id
 
 # ------------------------------------------------------
-# OCR helpers
-# ------------------------------------------------------
-def _pil_from_pixmap(pm: fitz.Pixmap) -> Image.Image:
-    if pm.alpha:  # convert RGBA to RGB for tesseract
-        pm = fitz.Pixmap(pm, 0)  # remove alpha
-    img = Image.frombytes("RGB", [pm.width, pm.height], pm.samples)
-    return img
-
-def _ocr_pil(img: Image.Image) -> str:
-    # Reasonable defaults for dense text
-    return pytesseract.image_to_string(img, lang=OCR_LANG, config="--oem 3 --psm 6")
-
-def ocr_pdf_to_pages(pdf_bytes: bytes, dpi: int = OCR_DPI) -> List[str]:
-    """Rasterize each page with PyMuPDF and OCR with Tesseract."""
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    pages_txt: List[str] = []
-    print(f"[COACHDEBUG] OCR: pdf pages={doc.page_count}, dpi={dpi}")
-    # scale for dpi: 72 * scale = dpi
-    scale = dpi / 72.0
-    mat = fitz.Matrix(scale, scale)
-    for i, page in enumerate(doc, start=1):
-        pm = page.get_pixmap(matrix=mat, alpha=False)
-        img = _pil_from_pixmap(pm)
-        txt = _ocr_pil(img) or ""
-        pages_txt.append(txt)
-        if i <= 2:
-            print(f"[COACHDEBUG] OCR page {i} chars={len(txt)} sample={_norm(txt)[:80]!r}")
-    doc.close()
-    return pages_txt
-
-def ocr_image_bytes(img_bytes: bytes) -> str:
-    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    return _ocr_pil(img) or ""
-
-# ------------------------------------------------------
-# PDF indexing
+# PDF indexing (Option A)
 # ------------------------------------------------------
 def extract_pdf_pages(pdf_bytes: bytes) -> List[str]:
-    """Return list of normalized text per page (native text, no OCR)."""
+    """Return list of normalized text per page."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages_norm: List[str] = []
     print(f"[COACHDEBUG] PyMuPDF pages: {doc.page_count}")
@@ -154,6 +108,7 @@ def index_pages(user_id: str, file_id: str, pages_norm: List[str]) -> None:
     print(f"[COACHDEBUG] Indexed pages for user={user_id}, file_id={file_id}, pages={len(pages_norm)}")
 
 def _probe_snippets(q: str) -> List[str]:
+    # generate several probes from the quote (beginning/middle/end)
     q = q.strip()
     L = len(q)
     if L < 30:
@@ -171,6 +126,7 @@ def _probe_snippets(q: str) -> List[str]:
     return out or [q[:120]]
 
 def locate_page(user_id: str, file_id: str, quoted_snippet: str) -> Optional[int]:
+    """Find 1-based page number where quoted_snippet appears (exact -> fuzzy)."""
     pages = _PAGE_INDEX.get(user_id, {}).get(file_id)
     if not pages:
         print("[COACHDEBUG] No page index available for locate_page")
@@ -185,14 +141,14 @@ def locate_page(user_id: str, file_id: str, quoted_snippet: str) -> Optional[int
     probes = [_norm(s) for s in _probe_snippets(q_raw)]
     print(f"[COACHDEBUG] Probes: {[p[:50] for p in probes]}")
 
-    # 1) exact
+    # 1) exact substring on any probe
     for i, page_text in enumerate(pages, start=1):
         for probe in probes:
             if probe and probe in page_text:
                 print(f"[COACHDEBUG] Exact match on page {i}")
                 return i
 
-    # 2) fuzzy
+    # 2) fuzzy best-match
     best_page, best_ratio = None, 0.0
     for i, page_text in enumerate(pages, start=1):
         for probe in probes:
@@ -222,6 +178,7 @@ def post_user_message(thread_id: str, content: str, file_ids: Optional[List[str]
     )
 
 async def run_and_wait(thread_id: str, assistant_id: str, timeout_s: int = 90) -> Tuple[str, List[dict]]:
+    """Async poll to avoid blocking Discord heartbeat."""
     client = _client_once()
     print(f"[COACHDEBUG] Starting run for thread={thread_id}, assistant={assistant_id}")
 
@@ -290,18 +247,19 @@ async def run_and_wait(thread_id: str, assistant_id: str, timeout_s: int = 90) -
 _QUOTE_RX = re.compile(r'“([^”]+)”|"([^"]+)"')
 
 def _extract_quote_from_answer(answer: str) -> Optional[str]:
-    best = ""
-    for m in _QUOTE_RX.finditer(answer or ""):
-        q = (m.group(1) or m.group(2) or "").strip()
-        if len(q) > len(best):
-            best = q
-    return best if len(best) >= 12 else None
+    m = _QUOTE_RX.search(answer or "")
+    if not m:
+        return None
+    q = m.group(1) or m.group(2)
+    q = (q or "").strip()
+    return q if len(q) >= 12 else None
 
 def synthesize_citations_from_answer(answer: str, user_id: str) -> List[dict]:
     quote = _extract_quote_from_answer(answer)
     if not quote:
         print("[COACHDEBUG] No explicit quote found in answer for fallback")
         return []
+    # Try each known file for this user
     file_ids = _FILES_BY_USER.get(user_id, [])
     for fid in file_ids:
         page = locate_page(user_id, fid, quote)
@@ -312,18 +270,6 @@ def synthesize_citations_from_answer(answer: str, user_id: str) -> List[dict]:
         print("[COACHDEBUG] Fallback could not locate page; returning minimal citation")
         return [{"file_id": file_ids[-1], "quote": quote}]
     return []
-
-_CITATIONS_HEADER_RX = re.compile(r'^\s*citations\s*:?\s*$', re.IGNORECASE | re.MULTILINE)
-_PAREN_SOURCE_RX = re.compile(r'\((?:page\s*\d+|p\.\s*\d+|[^()]+\.pdf(?:,\s*page\s*\w+)?|page\s*n/?a)\)', re.IGNORECASE)
-def sanitize_answer(answer: str) -> str:
-    if not answer:
-        return answer
-    parts = _CITATIONS_HEADER_RX.split(answer)
-    if len(parts) > 1:
-        answer = parts[0].strip()
-    answer = _PAREN_SOURCE_RX.sub("", answer)
-    answer = re.sub(r'\s{2,}', ' ', answer).strip()
-    return answer
 
 def format_with_citations(answer: str, citations: List[dict], user_id: str) -> str:
     if not citations:
@@ -362,12 +308,10 @@ def format_with_citations(answer: str, citations: List[dict], user_id: str) -> s
 # ------------------------------------------------------
 async def coach_answer(user_id: str, question: Optional[str], attachment: Optional[dict]) -> str:
     """
-    Phase 1 behavior + OCR:
-      - Strict preflight (reject empty/corrupted).
-      - If PDF has no/low text, run OCR per page; for images, OCR directly.
-      - Upload original PDF (if readable) OR generated TXT (if OCR).
-      - Build per-page index (native text or OCR text).
-      - Retrieval-first answers; summaries only if asked.
+    Phase 1 behavior:
+      - Strict preflight (reject empty/corrupted/image-only PDFs BEFORE upload).
+      - Build per-page index after successful upload.
+      - Retrieval-first answers (prompt enforces); summaries only if asked.
       - Page numbers via local page matching. Fallback when annotations absent.
     """
     if not _assistant_id:
@@ -377,10 +321,7 @@ async def coach_answer(user_id: str, question: Optional[str], attachment: Option
     file_ids: List[str] = []
 
     fid: Optional[str] = None
-    pages_norm_pre: Optional[List[str]] = None  # normalized per-page text (native or OCR)
-    upload_bytes: Optional[bytes] = None
-    upload_mime: Optional[str] = None
-    upload_name: Optional[str] = None
+    pages_norm_pre: Optional[List[str]] = None  # normalized per-page text from preflight
 
     if attachment:
         ct = attachment.get("content_type") or _infer_mime_from_name(attachment.get("filename", ""))
@@ -389,7 +330,7 @@ async def coach_answer(user_id: str, question: Optional[str], attachment: Option
 
         # Basic guards
         if ct not in ALLOWED_TYPES:
-            return "Unsupported file type. Please upload PDF, TXT, PNG, or JPG."
+            return "Unsupported file type. Please upload PDF or TXT."
         if size == 0:
             return "This file is empty, no analysis possible."
         if size < MIN_FILE_BYTES:
@@ -410,9 +351,8 @@ async def coach_answer(user_id: str, question: Optional[str], attachment: Option
             return "This file is empty, no analysis possible."
         print(f"[COACHDEBUG] Downloaded bytes={len(data)}")
 
-        # ---- Branch by type ----
+        # ---- Strict preflight BEFORE OpenAI upload ----
         if ct == "application/pdf":
-            # Preflight native text
             try:
                 doc = fitz.open(stream=data, filetype="pdf")
                 page_count = doc.page_count
@@ -422,47 +362,29 @@ async def coach_answer(user_id: str, question: Optional[str], attachment: Option
                     return "This file is corrupted and cannot be read."
 
                 raw_text_lens, norm_text_lens = [], []
-                pages_norm_native = []
+                pages_norm_pre = []
                 for p in doc:
                     t = p.get_text("text") or ""
                     raw_text_lens.append(len(t))
                     n = _norm(t)
                     norm_text_lens.append(len(n))
-                    pages_norm_native.append(n)
+                    pages_norm_pre.append(n)
                 doc.close()
 
+                total_text_raw = sum(raw_text_lens)
                 total_text_norm = sum(norm_text_lens)
-                print(f"[COACHDEBUG] PDF preflight: pages={page_count}, total_text_norm={total_text_norm}")
+                print(f"[COACHDEBUG] PDF preflight: pages={page_count}, "
+                      f"total_text_raw={total_text_raw}, total_text_norm={total_text_norm}, "
+                      f"first3_raw={raw_text_lens[:3]}, first3_norm={norm_text_lens[:3]}")
 
-                if total_text_norm >= MIN_TEXT_CHARS_NORM:
-                    # Use native text path
-                    pages_norm_pre = pages_norm_native
-                    upload_bytes = data
-                    upload_mime = "application/pdf"
-                    upload_name = attachment["filename"]
-                else:
-                    # OCR path
-                    print("[COACHDEBUG] Low native text -> running OCR per page")
-                    pages_ocr = ocr_pdf_to_pages(data, dpi=OCR_DPI)
-                    total_ocr_norm = sum(len(_norm(t)) for t in pages_ocr)
-                    print(f"[COACHDEBUG] OCR total norm chars={total_ocr_norm}")
-                    if total_ocr_norm < MIN_TEXT_CHARS_NORM:
-                        return ("I couldn’t extract readable text from this scan. "
-                                "Please upload a clearer document.")
-                    pages_norm_pre = [_norm(t) for t in pages_ocr]
-                    # Create a single TXT payload for the Assistant (join pages)
-                    ocr_joined = "\n\n".join(f"[Page {i+1}]\n{pages_ocr[i]}" for i in range(len(pages_ocr)))
-                    upload_bytes = ocr_joined.encode("utf-8", errors="ignore")
-                    upload_mime = "text/plain"
-                    base = os.path.splitext(attachment["filename"])[0]
-                    upload_name = f"{base}.ocr.txt"
-
+                if total_text_norm < MIN_TEXT_CHARS_NORM:
+                    return ("I couldn’t find searchable text in this document. "
+                            "If it’s a scanned/image-only PDF, text extraction isn’t enabled in this phase.")
             except Exception as e:
-                print(f"[COACHDEBUG] PDF preflight/OCR error: {e}")
+                print(f"[COACHDEBUG] PyMuPDF preflight error: {e}")
                 return "This file is corrupted and cannot be read."
 
         elif ct == "text/plain":
-            # TXT: ensure non-empty
             try:
                 txt = (data.decode("utf-8", errors="ignore")).strip()
             except Exception:
@@ -470,32 +392,11 @@ async def coach_answer(user_id: str, question: Optional[str], attachment: Option
             if len(txt) == 0:
                 print("[COACHDEBUG] TXT is empty after decode/strip")
                 return "This file is empty, no analysis possible."
-            # No pages, but we keep a 1-page index for consistency
-            pages_norm_pre = [_norm(txt)]
-            upload_bytes = data
-            upload_mime = "text/plain"
-            upload_name = attachment["filename"]
+            # pages_norm_pre remains None for TXT
 
-        elif ct in ("image/png", "image/jpeg"):
-            print("[COACHDEBUG] Image uploaded -> OCR path")
-            try:
-                txt = ocr_image_bytes(data)
-                if len(_norm(txt)) < MIN_TEXT_CHARS_NORM:
-                    return ("I couldn’t extract readable text from this image. "
-                            "Please upload a clearer screenshot or PDF.")
-                pages_norm_pre = [_norm(txt)]   # 1-page “document”
-                # Provide a TXT to Assistant
-                upload_bytes = txt.encode("utf-8", errors="ignore")
-                upload_mime = "text/plain"
-                base = os.path.splitext(attachment["filename"])[0]
-                upload_name = f"{base}.ocr.txt"
-            except Exception as e:
-                print(f"[COACHDEBUG] Image OCR error: {e}")
-                return "This image seems unreadable. Please upload a clearer file."
-
-        # ---- Upload selected payload to OpenAI ----
+        # ---- Upload to OpenAI (safe now) ----
         try:
-            fid = upload_file_to_openai(upload_bytes, upload_name, upload_mime)  # type: ignore[arg-type]
+            fid = upload_file_to_openai(data, attachment["filename"], ct)
         except RuntimeError as e:
             if str(e) == "UPLOAD_ERROR_CORRUPTED":
                 return "This file is corrupted and cannot be read."
@@ -505,26 +406,38 @@ async def coach_answer(user_id: str, question: Optional[str], attachment: Option
 
         # Track user->file for fallback matching
         _FILES_BY_USER.setdefault(user_id, []).append(fid)
-        index_pages(user_id, fid, pages_norm_pre or [])
+
+        # Build page index AFTER upload (using preflight pages if available)
+        if ct == "application/pdf":
+            if pages_norm_pre is None:
+                try:
+                    print("[COACHDEBUG] pages_norm_pre missing; extracting after upload")
+                    pages_norm_pre = extract_pdf_pages(data)
+                except Exception as e:
+                    print(f"[COACHDEBUG] Page extraction failed post-upload: {e}")
+                    pages_norm_pre = []
+            index_pages(user_id, fid, pages_norm_pre)
+        else:
+            index_pages(user_id, fid, [])  # TXT: no pages
 
         file_ids.append(fid)
         _HAS_FILE_IN_SESSION[user_id] = True  # only after full validation + upload success
 
     # Require prior valid upload if none in this call
     if not file_ids and not _HAS_FILE_IN_SESSION.get(user_id, False):
-        return "Please upload a PDF, TXT, PNG, or JPG to start a new session."
+        return "Please upload a PDF or TXT to start a new session."
 
     # Ask the question
     post_user_message(thread_id, question or "", file_ids if file_ids else None)
     answer, cites = await run_and_wait(thread_id, _assistant_id)
 
-    # Sanitize model-added fake citations/pages, then synthesize if needed
-    answer = sanitize_answer(answer)
+    # If the Assistant didn't return annotations, synthesize from the answer's quoted text
     if not cites:
         fallback_cites = synthesize_citations_from_answer(answer, user_id)
         if fallback_cites:
             cites = fallback_cites
 
+    # Optional nudge if model tried to summarize (still format either way)
     if not any(ch in answer for ch in ['"', '“', '”']) and not cites:
         print("[COACHDEBUG] No quotes detected in answer; model likely summarized (prompt should prevent).")
 

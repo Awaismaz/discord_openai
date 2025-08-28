@@ -1,0 +1,23 @@
+services:
+  - type: worker
+    name: nextplay-discord-bot
+    env: docker
+    plan: starter
+    autoDeploy: true
+    envVars:
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: NPF_ASSISTANT_ID
+        sync: false
+      - key: CHAT_CHANNEL
+        value: chat
+      - key: COACH_CHANNEL
+        value: coach
+      - key: RATE_LIMIT_PER_MINUTE
+        value: "5"
+      - key: OCR_LANG
+        value: eng
+      - key: TESSERACT_CMD
+        value: /usr/bin/tesseract
